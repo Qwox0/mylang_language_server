@@ -1,0 +1,22 @@
+std :: #import "std";
+libc :: #import "libc";
+
+main :: -> {
+    mut buf: [1 * 1024 * 1024]u8;
+    buf := buf[..]mut;
+
+    init :=
+        \\{"capabilities":{}}
+    ;
+
+    while true {
+        libc.fprintf(libc.stderr, "waiting on stdin ...\n".ptr);
+        read_len := libc.read(libc.STDIN_FILENO, buf.ptr, buf.len);
+        line := buf[..read_len];
+        libc.fprintf(libc.stderr, "got input:\n".ptr);
+        libc.fprintf(libc.stderr, "%.*s\n".ptr, line.len, line.ptr);
+    }
+
+    libc.fprintf(libc.stderr, "main loop exited\n".ptr);
+    libc.fflush(libc.stderr);
+}
