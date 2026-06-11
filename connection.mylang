@@ -1,0 +1,362 @@
+std :: #import "std";
+libc :: #import "libc";
+Json :: std.json.Json;
+
+DEBUG :: true;
+
+// `1` or `"1"`
+RequestId :: []u8;
+
+LspAny :: []u8;
+
+Connection :: struct {
+}
+
+// ------------------------------------
+
+ClientMessage :: struct {
+    kind: Kind;
+    method: []u8;
+    params: ?*Json;
+
+    Kind :: enum {
+        Request(RequestId),
+        Notification,
+    };
+}
+
+ReceiveError :: enum {
+    ReadFailed(libc.E),
+    BufTooSmall(usize),
+
+    HeaderParseFailed(Header.ParseErr),
+    MissingContentLengthHeader,
+    InvalidContentLengthHeader(int),
+    UnexpectedHeader(Header),
+    UnexpectedEOF(struct { body_len: usize, content_length: uint }),
+
+    JsonParseFailed(void /* TODO: JsonParseError */),
+    BodyNotObject,
+    InvalidId(*Json),
+    MissingMethod,
+    InvalidMethod(*Json),
+}
+
+ReceiveResult :: enum {
+    Ok(ClientMessage),
+    ConnectionClosed,
+    Err(ReceiveError),
+}
+
+Connection.receive :: (c: *Connection, buf: []mut u8) -> ReceiveResult {
+    mut req_alloc := std.mem.FixedArenaAllocator.new(buf[..]mut);
+
+    if DEBUG libc.fprintf(libc.stderr, "waiting on stdin ...\n".ptr);
+    req_data := {
+        buf := req_alloc.&.capacity_buf();
+        res := libc.result(libc.read(libc.STDIN_FILENO, buf.ptr, buf.len));
+        // TODO: EINTR
+        read_len := switch res { .Ok :> res, .Err :> return .Err(.ReadFailed(res)) };
+        if read_len == 0 return .ConnectionClosed;
+        req_alloc.&mut.allocator().alloc(read_len, 1) orelse std.panic("unreachable");
+        buf[..read_len]
+    };
+    if DEBUG libc.fprintf(libc.stderr, "got input:\n%.*s\n".ptr, req_data.len, req_data.ptr);
+
+    req: struct { content_type: []u8, body: []u8 } = {
+        mut content_length: ?int = null;
+        mut content_type := "utf-8";
+
+        mut cursor := Cursor.(req_data);
+        loop {
+            res := Header.parse(&mut cursor);
+            header := switch res {
+                .Ok :> res,
+                .End :> break,
+                .Err :> return .Err(.HeaderParseFailed(res)),
+            };
+            // TODO: case-insensitive
+            if std.str.eq(header.field_name, "Content-Length")
+                content_length = Some(libc.atol(header.val.ptr))
+            else if std.str.eq(header.field_name, "Content-Type")
+                content_type = header.val
+            else return .Err(.UnexpectedHeader(header));
+        };
+        body := cursor.text[cursor.pos..];
+
+        content_length := content_length orelse return .Err(.MissingContentLengthHeader);
+        if content_length < 0 return .Err(.InvalidContentLengthHeader(content_length));
+        content_length := content_length.as(uint);
+        if body.len < content_length return .Err(.UnexpectedEOF(.{ body_len=body.len, content_length }));
+
+        .{ content_type, body = body[..content_length] }
+    };
+
+    res := std.json.parse_dyn(req.body, .{}, req_alloc.&mut.allocator());
+    //res := std.json.parse_dyn(req.body);
+    body := res orelse return .Err(.JsonParseFailed);
+    fields := switch body { .Object :> body } else return .Err(.BodyNotObject);
+
+    // "jsonrpc": "2.0"
+
+    id := fields.get("id").as(?*Json);
+    kind: ClientMessage.Kind = switch id {
+        Some :> .Request(switch id { .Number :> id.*, .String :> id.* }
+            else return .Err(.InvalidId(id))),
+        null :> .Notification,
+    };
+
+    method := fields.get("method").as(?*Json) orelse return .Err(.MissingMethod);
+    method := switch method { .String :> method.* } else return .Err(.InvalidMethod(method));
+
+    params := fields.get("params").as(?*Json);
+    // TODO: check params is array or object
+
+    if DEBUG libc.fprintf(libc.stderr, "allocated %zu of %zu bytes\n".ptr, req_alloc.&.allocated(), req_alloc.&.buf_size());
+
+    .Ok(.{ kind, method, params })
+}
+
+Cursor :: struct {
+    text: []u8;
+    pos: uint = 0;
+
+    get :: (c: *Cursor) -> std.slice.get_u8(c.*.text, c.*.pos);
+    inc :: (c: *mut Cursor) -> c.*.pos += 1;
+
+    advance_if :: (c: *mut Cursor, f: *(char: u8) -> bool) -> {
+        char := c.get() orelse return false;
+        advance := f.*(char);
+        if advance  c.inc();
+        advance
+    }
+
+    eat :: (c: *mut Cursor, char: u8) -> {
+        advance := char == (c.get() orelse return false);
+        if advance  c.inc();
+        advance
+    }
+}
+
+Header :: struct {
+    field_name: []u8,
+    val: []u8,
+
+    ParseErr :: enum { MissingValue, MissingCRLF }
+    ParseResult :: enum {
+        Ok(Header),
+        End,
+        Err(ParseErr),
+    }
+    parse :: (cursor: *mut Cursor) -> ParseResult {
+        field_name_start := cursor.*.pos;
+        while cursor.advance_if(& char -> char != ':' and char != '\n' and char != '\r') {}
+        field_name := cursor.*.text[field_name_start..cursor.*.pos];
+
+        res := if cursor.eat(':') {
+            while cursor.advance_if(&is_ows) {}
+
+            value_start := cursor.*.pos;
+            while cursor.advance_if(& char -> char != '\n' and char != '\r') {}
+            val := cursor.*.text[value_start..cursor.*.pos];
+            ParseResult.Ok(.{ field_name, val })
+        } else {
+            if field_name.len > 0 return .Err(.MissingValue);
+            .End
+        };
+
+        if not cursor.eat('\r') return .Err(.MissingCRLF);
+        if not cursor.eat('\n') return .Err(.MissingCRLF);
+
+        res
+    }
+}
+
+/// <https://datatracker.ietf.org/doc/html/rfc7230#section-3.2.3>
+is_ows :: (byte: u8) -> byte == ' ' or byte == '\t';
+
+// ------------------------------------
+
+Message :: enum {
+    ResponseOk(struct {
+        // can be `null`, when?
+        req_id: RequestId,
+        result: LspAny,
+    }),
+    ResponseErr(struct {
+        // can be `null`, when?
+        req_id: RequestId,
+        code: int,
+        message: []u8,
+        // TODO: data: ?LspAny,
+    }),
+    Request(struct {
+        id: RequestId,
+        method: []u8,
+        /// TODO: `params?: array | object;`
+        params: []u8,
+    }),
+    Notification(struct {
+        method: []u8,
+        /// TODO: `params?: array | object;`
+        params: []u8,
+    }),
+}
+
+Connection.send :: (c: *Connection, msg: Message) -> {
+    mut buf: [10 * 1024]u8;
+    buf := buf[..]mut;
+    wrote := switch msg {
+        .ResponseOk :> libc.snprintf(
+            buf.ptr, buf.len,
+            \\{"jsonrpc":"2.0","id":%.*s,"result":%.*s}
+            .ptr,
+            msg.req_id.len, msg.req_id.ptr,
+            msg.result.len, msg.result.ptr,
+        ),
+        .ResponseErr :> libc.snprintf(
+            buf.ptr, buf.len,
+            \\{"jsonrpc":"2.0","id":%.*s,"error":{"code":%d,"message":%.*s}}
+            .ptr,
+            msg.req_id.len, msg.req_id.ptr,
+            msg.code,
+            msg.message.len, msg.message.ptr,
+        ),
+        .Request :> libc.snprintf(
+            buf.ptr, buf.len,
+            \\{"jsonrpc":"2.0","id":%.*s,"method":"%.*s","params":%.*s}
+            .ptr,
+            msg.id.len, msg.id.ptr,
+            msg.method.len, msg.method.ptr,
+            msg.params.len, msg.params.ptr,
+        ),
+        .Notification :> libc.snprintf(
+            buf.ptr, buf.len,
+            \\{"jsonrpc":"2.0","method":"%.*s","params":%.*s}
+            .ptr,
+            msg.method.len, msg.method.ptr,
+            msg.params.len, msg.params.ptr,
+        ),
+    };
+    if wrote >= buf.len.as(i32) std.panic("message too long");
+    data := buf[..wrote];
+
+    if DEBUG libc.fprintf(libc.stderr, "sending:\n%.*s\n".ptr, data.len, data.ptr);
+    libc.printf("Content-Length: %zu\r\n\r\n%.*s".ptr, data.len, data.len, data.ptr);
+    libc.fflush(libc.stdout);
+}
+
+// ------------------------------------
+
+Connection.initialize :: (req_buf: []mut u8) -> {
+    conn := Connection.{};
+
+    // "initialize" Request
+    loop {
+        req := conn.&.receive(req_buf);
+        req := switch req { .Ok :> req } else {
+            conn.&.send(.ResponseErr(.{
+                req_id = "0",
+                code = INVALID_REQUEST,
+                message = "invalid `initialize` request"
+            }));
+            return null;
+        };
+
+        k := req.kind;
+        req_id := switch k {
+            .Request :> k,
+            // TODO: handle exit notification
+            .Notification :> continue,
+        };
+
+        if not std.str.eq(req.method, "initialize") {
+            conn.&.send(.ResponseErr(.{
+                req_id,
+                code = SERVER_NOT_INITIALIZED,
+                message = "SERVER_NOT_INITIALIZED"
+            }));
+            return null;
+        }
+
+        // TODO: use req.params
+
+        conn.&.send(.ResponseOk(.{
+            req_id,
+            result = \\{"capabilities":{"definitionProvider":true},"serverInfo":{"name":"mylang_ls","version":"0.0.0"}}
+        }));
+
+        break;
+    }
+
+    // "initialized" Notification
+    {
+        req := conn.&.receive(req_buf);
+        req := switch req { .Ok :> req } else {
+            conn.&.send(.ResponseErr(.{
+                req_id = "null",
+                code = INVALID_REQUEST,
+                message = "invalid `initialized` notification"
+            }));
+            return null;
+        };
+
+        k := req.kind;
+        err_id := switch k {
+            .Request :> k,
+            .Notification :> if std.str.eq(req.method, "initialized") then null else "null",
+        };
+
+        switch err_id {
+            Some :> {
+                conn.&.send(.ResponseErr(.{
+                    req_id = err_id,
+                    code = INVALID_REQUEST,
+                    message = "invalid request. expected `initialized` notification"
+                }));
+                return null;
+            };
+            null :> {}
+        }
+    }
+
+    return Some(conn);
+}
+
+
+// Defined by JSON-RPC
+PARSE_ERROR :: -32700;
+INVALID_REQUEST :: -32600;
+METHOD_NOT_FOUND :: -32601;
+INVALID_PARAMS :: -32602;
+INTERNAL_ERROR :: -32603;
+
+/// Error code indicating that a server received a notification or request
+/// before the server received the `initialize` request.
+SERVER_NOT_INITIALIZED :: -32002;
+UNKNOWN_ERROR_CODE :: -32001;
+
+/// A request failed but it was syntactically correct, e.g the method name was
+/// known and the parameters were valid. The error message should contain human
+/// readable information about why the request failed.
+///
+/// @since 3.17.0
+REQUEST_FAILED :: -32803;
+
+/// The server cancelled the request. This error code should only be used for
+/// requests that explicitly support being server cancellable.
+///
+/// @since 3.17.0
+SERVER_CANCELLED :: -32802;
+
+/// The server detected that the content of a document got modified outside
+/// normal conditions. A server should NOT send this error code if it detects a
+/// content change in its unprocessed messages. The result even computed on an
+/// older state might still be useful for the client.
+///
+/// If a client decides that a result is not of any use anymore the client
+/// should cancel the request.
+CONTENT_MODIFIED :: -32801;
+
+/// The client has canceled a request and a server has detected the cancel.
+REQUEST_CANCELLED :: -32800;

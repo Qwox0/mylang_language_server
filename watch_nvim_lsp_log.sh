@@ -17,7 +17,9 @@ error() {
     if [ ${2:-1} -ne 0 ]; then exit ${2:-1}; fi
 }
 
-tail -F ~/.local/state/nvim/lsp.log |
+rm ~/.local/state/nvim/logs/lsp.log
+
+tail -F ~/.local/state/nvim/logs/lsp.log |
     stdbuf -oL awk -F'\t' '$3 == "\"mylang_ls\""' |
     while IFS=$'\t' read -r i _ lsp _ body; do
         echo "$(cut -d' ' -f -2 <<< "$i") $lsp:"
@@ -27,10 +29,11 @@ tail -F ~/.local/state/nvim/lsp.log |
         body="${body#\"}"
         body="${body%\"}"
         echo "$body" | sed 's/\(\\r\)\?\\n/\n/g' | while read -r line; do
+            #echo "line: $line"
             if [[ "$line" == "{"* ]]; then
-                jq -C <<< "$line" || echo "$line"
+                echo "$line" | sed 's/\\"/"/g' | jq -C || echo "E: $line"
             else
-                echo "$line"
+                echo "E: $line"
             fi
         done
         echo ""

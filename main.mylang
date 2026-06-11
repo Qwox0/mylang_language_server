@@ -1,22 +1,68 @@
 std :: #import "std";
 libc :: #import "libc";
+Json :: std.json.Json;
+
+Connection :: #import "./connection.mylang".Connection;
 
 main :: -> {
     mut buf: [1 * 1024 * 1024]u8;
     buf := buf[..]mut;
 
+    conn := Connection.initialize(buf) orelse return 1;
+
+    /*
     init :=
         \\{"capabilities":{}}
     ;
+    */
 
+    {
+        conn.&.send(.Request(.{
+            id = "2",
+            method = "window/workDoneProgress/create",
+            params = \\{"token":12345}
+        }));
+
+        conn.&.send(.Notification(.{
+            method = "$/progress",
+            params = \\{"token":12345,"value":{"kind":"begin","title":"Hello World","message":"Message"}}
+        }));
+
+        libc.sleep(2);
+        libc.fprintf(libc.stderr, "end_notification\n".ptr);
+
+        conn.&.send(.Notification(.(
+            "$/progress",
+            \\{"token":12345,"value":{"kind":"end","message":"Hello World END"}}
+        )));
+    }
+
+    libc.fprintf(libc.stderr, "starting event loop\n".ptr);
     while true {
-        libc.fprintf(libc.stderr, "waiting on stdin ...\n".ptr);
-        read_len := libc.read(libc.STDIN_FILENO, buf.ptr, buf.len);
-        line := buf[..read_len];
-        libc.fprintf(libc.stderr, "got input:\n".ptr);
-        libc.fprintf(libc.stderr, "%.*s\n".ptr, line.len, line.ptr);
+        req := conn.&.receive(buf);
+        req := switch req {
+            .Ok :> req;
+            .ConnectionClosed :> break;
+            .Err :> {
+                libc.fprintf(libc.stderr, "Err\n".ptr);
+                continue;
+            }
+        };
+
+        k := req.kind;
+        switch k {
+            .Request :> {
+                libc.fprintf(libc.stderr, "req_id = %.*s\n".ptr, k.len, k.ptr);
+            },
+            .Notification :> {
+                libc.fprintf(libc.stderr, "got Notification\n".ptr);
+            },
+        };
+
     }
 
     libc.fprintf(libc.stderr, "main loop exited\n".ptr);
     libc.fflush(libc.stderr);
+
+    0
 }
