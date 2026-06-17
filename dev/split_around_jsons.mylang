@@ -1,0 +1,76 @@
+std :: #import "std";
+libc :: #import "libc";
+
+/*
+main :: -> {
+    mut buf: [1 * 1024 * 1024]u8;
+    buf := buf[..]mut;
+
+    loop {
+        read := libc.result(libc.read(libc.STDIN_FILENO, buf.ptr, buf.len)).unwrap();
+        if read == 0 break;
+        input := buf[..read];
+        //libc.fprintf(libc.stderr, "input = '%.*s'\n".ptr, input.len, input.ptr);
+
+        mut emitted: uint = 0;
+        mut brace_depth := 0;
+        for idx in 0..input.len {
+            byte := input[idx];
+            //libc.fprintf(libc.stderr, "input[%2d] = '%c'; brace_depth = %d\n".ptr, idx, byte, brace_depth);
+
+            if byte == '{' {
+                if brace_depth == 0 {
+                    std.println(input[emitted..idx]);
+                    emitted = idx;
+                }
+                brace_depth += 1;
+            } else if byte == '}' {
+                if brace_depth == 0 continue; // ignore additional '}'
+                if brace_depth == 1 {
+                    std.println(input[emitted..=idx]);
+                    emitted = idx + 1;
+                }
+                brace_depth -= 1;
+            }
+        }
+        std.print(input[emitted..input.len]);
+    }
+}
+*/
+main :: -> {
+    mut buf: [1 * 1024 * 1024]u8;
+    buf := buf[..]mut;
+
+    loop {
+        r := libc.read(libc.STDIN_FILENO, buf.ptr, buf.len);
+        unwrap :: (r: int) -> libc.result(r).unwrap();
+        read := unwrap(r);
+        if read == 0 break;
+        input := buf[..read];
+        //libc.fprintf(libc.stderr, "input = '%.*s'\n".ptr, input.len, input.ptr);
+
+        mut emitted: uint = 0;
+        mut brace_depth := 0;
+        for idx in 0..input.len {
+            byte := input[idx];
+            //libc.fprintf(libc.stderr, "input[%2d] = '%c'; brace_depth = %d\n".ptr, idx, byte, brace_depth);
+
+            if byte == '{' {
+                if brace_depth == 0 {
+                    std.println(input[emitted..idx]);
+                    emitted = idx;
+                }
+                brace_depth += 1;
+            } else if byte == '}' {
+                if brace_depth == 0 continue; // ignore additional '}'
+                if brace_depth == 1 {
+                    std.println(input[emitted..=idx]);
+                    emitted = idx + 1;
+                }
+                brace_depth -= 1;
+            }
+        }
+        std.print(input[emitted..input.len]);
+    }
+}
+

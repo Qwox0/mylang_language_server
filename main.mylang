@@ -2,19 +2,31 @@ std :: #import "std";
 libc :: #import "libc";
 Json :: std.json.Json;
 
-Connection :: #import "./connection.mylang".Connection;
+time_h :: #import "../mylang_c_bindings/generated/libc/time.h.mylang";
+
+connection :: #import "./connection.mylang";
+Connection :: connection.Connection;
+ClientMessage :: connection.ClientMessage;
+RequestId :: connection.RequestId;
 
 main :: -> {
     mut buf: [1 * 1024 * 1024]u8;
     buf := buf[..]mut;
 
-    conn := Connection.initialize(buf) orelse return 1;
-
-    /*
     init :=
-        \\{"capabilities":{}}
+        \\{"capabilities":{
+        \\  "textDocumentSync":1,
+        //\\  "completionProvider":{
+        //\\    "resolveProvider":true,
+        //\\    "triggerCharacters":["1"]
+        //\\  },
+        //\\  "definitionProvider":true,
+        \\  "hoverProvider":true
+        \\},"serverInfo":{"name":"mylang_ls","version":"0.0.0"}}
     ;
-    */
+    conn := Connection.initialize(buf, init) orelse return 1;
+
+    mut server := LanguageServer.{ conn };
 
     {
         conn.&.send(.Request(.{
@@ -23,18 +35,16 @@ main :: -> {
             params = \\{"token":12345}
         }));
 
-        conn.&.send(.Notification(.{
-            method = "$/progress",
-            params = \\{"token":12345,"value":{"kind":"begin","title":"Hello World","message":"Message"}}
-        }));
+        conn.&.receive(buf);
 
-        libc.sleep(2);
-        libc.fprintf(libc.stderr, "end_notification\n".ptr);
-
-        conn.&.send(.Notification(.(
-            "$/progress",
-            \\{"token":12345,"value":{"kind":"end","message":"Hello World END"}}
-        )));
+        rawtime := time_h.time(null);
+        wrote := libc.snprintf(
+            buf.ptr, buf.len,
+            \\{"token":12345,"value":{"kind":"begin","title":"%s"}}
+            .ptr,
+            time_h.ctime(&rawtime)
+        );
+        conn.&.send(.Notification(.{ method = "$/progress", params = buf[..wrote] }));
     }
 
     libc.fprintf(libc.stderr, "starting event loop\n".ptr);
@@ -44,25 +54,171 @@ main :: -> {
             .Ok :> req;
             .ConnectionClosed :> break;
             .Err :> {
-                libc.fprintf(libc.stderr, "Err\n".ptr);
+                err_kind := switch req {
+                    .ReadFailed :> "ReadFailed",
+                    .BufTooSmall :> "BufTooSmall",
+                    .HeaderParseFailed :> "HeaderParseFailed",
+                    .MissingContentLengthHeader :> "MissingContentLengthHeader",
+                    .InvalidContentLengthHeader :> "InvalidContentLengthHeader",
+                    .UnexpectedHeader :> "UnexpectedHeader",
+                    .UnexpectedEOF :> "UnexpectedEOF",
+                    .JsonParseFailed :> "JsonParseFailed",
+                    .BodyNotObject :> "BodyNotObject",
+                    .InvalidId :> "InvalidId",
+                    .MissingMethod :> "MissingMethod",
+                    .InvalidMethod :> "InvalidMethod",
+                };
+                libc.fprintf(libc.stderr, "Err: %.*s\n".ptr, err_kind.len, err_kind.ptr);
                 continue;
             }
         };
 
         k := req.kind;
         switch k {
-            .Request :> {
-                libc.fprintf(libc.stderr, "req_id = %.*s\n".ptr, k.len, k.ptr);
-            },
-            .Notification :> {
-                libc.fprintf(libc.stderr, "got Notification\n".ptr);
-            },
+            .Request :> handle_request(&server, k, req);
+            .Notification :> if handle_notification(&mut server, req) == .Exit break;
         };
-
     }
 
     libc.fprintf(libc.stderr, "main loop exited\n".ptr);
     libc.fflush(libc.stderr);
 
     0
+}
+
+LanguageServer :: struct {
+    conn: Connection;
+
+    loaded_files := std.hashmap.Str2PtrHashMap.EMPTY; // HashMap<str, *str>
+    loaded_files_alloc := std.mem.c_allocator;
+}
+
+HandleNotificationResult :: enum { Ok, Err, Exit };
+handle_notification :: (s: *mut LanguageServer, notification: ClientMessage) -> HandleNotificationResult {
+    libc.fprintf(libc.stderr, "NOTIFICATION: method = '%.*s'\n".ptr, notification.method.len, notification.method.ptr);
+    if std.str.eq(notification.method, "exit") {
+        .Exit
+    } else if std.str.eq(notification.method, "textDocument/didChange") {
+        params := notification.params orelse {
+            libc.fprintf(libc.stderr, "expected params for notification `textDocument/didChange`\n".ptr);
+            return .Err;
+        };
+        params := switch params { .Object :> params } else {
+            libc.fprintf(libc.stderr, "invalid DidChangeTextDocumentParams\n".ptr);
+            return .Err;
+        };
+
+        text_document := params.get("textDocument").as(?*Json) orelse {
+            libc.fprintf(libc.stderr, "missing DidChangeTextDocumentParams.textDocument\n".ptr);
+            return .Err;
+        };
+        text_document := switch text_document { .Object :> text_document } else {
+            libc.fprintf(libc.stderr, "invalid VersionedTextDocumentIdentifier\n".ptr);
+            return .Err;
+        };
+
+        file_uri := text_document.get("uri").as(?*Json) orelse {
+            libc.fprintf(libc.stderr, "missing VersionedTextDocumentIdentifier.uri\n".ptr);
+            return .Err;
+        };
+        file_uri := switch file_uri { .String :> file_uri.* } else {
+            libc.fprintf(libc.stderr, "invalid VersionedTextDocumentIdentifier.uri; expected string\n".ptr);
+            return .Err;
+        };
+
+        // TODO: check version?
+
+        content_changes := params.get("contentChanges").as(?*Json) orelse {
+            libc.fprintf(libc.stderr, "missing DidChangeTextDocumentParams.contentChanges\n".ptr);
+            return .Err;
+        };
+        content_changes := switch content_changes { .Array :> content_changes } else {
+            libc.fprintf(libc.stderr, "invalid DidChangeTextDocumentParams.contentChanges; expected array\n".ptr);
+            return .Err;
+        };
+
+        if content_changes.*.len == 0 return .Ok;
+        change := content_changes.get(content_changes.*.len - 1, #sizeof(Json)).as(?*Json)
+            orelse std.panic("unreachable");
+        change := switch change { .Object :> change } else {
+            libc.fprintf(libc.stderr, "invalid TextDocumentContentChangeEvent; expected object\n".ptr);
+            return .Err;
+        };
+        text := change.get("text").as(?*Json) orelse {
+            libc.fprintf(libc.stderr, "missing TextDocumentContentChangeEvent.text\n".ptr);
+            return .Err;
+        };
+        text := switch text { .String :> text.* } else {
+            libc.fprintf(libc.stderr, "invalid TextDocumentContentChangeEvent.text; expected array\n".ptr);
+            return .Err;
+        };
+
+        text_dup_ptr := s.*.loaded_files_alloc.alloc(#sizeof([]u8), #alignof([]u8)).as(?*mut []u8) orelse std.panic("oom");
+        text_dup_ptr.* = std.str.strdup(text, s.*.loaded_files_alloc) orelse std.panic("oom");
+
+        if not s.*.loaded_files.&.contains_key(&file_uri) {
+            key_dup := std.str.strdup(file_uri, s.*.loaded_files_alloc) orelse std.panic("oom");
+            old_text := s.*.loaded_files.&mut.insert(key_dup, text_dup_ptr, s.*.loaded_files_alloc);
+            std.assert(old_text == null);
+        } else {
+            old_text := s.*.loaded_files.&mut.insert(file_uri, text_dup_ptr, s.*.loaded_files_alloc).as(?*[]u8) orelse std.panic("unreachable");
+            s.*.loaded_files_alloc.free(old_text.*.ptr.as(*mut any));
+            s.*.loaded_files_alloc.free(old_text.as(*mut any));
+        }
+
+        libc.fprintf(libc.stderr, "stored file changed. loaded_files.size() = %d\n".ptr, s.*.loaded_files.&.size());
+        .Err
+    } else {
+        libc.fprintf(libc.stderr, "unhandled notification: '%.*s'\n".ptr, notification.method.len, notification.method.ptr);
+        .Err
+    }
+}
+
+handle_request :: (s: *LanguageServer, req_id: RequestId, req: ClientMessage) -> {
+    libc.fprintf(libc.stderr, "REQEST: id = %.*s; method = '%.*s'\n".ptr, req_id.len, req_id.ptr, req.method.len, req.method.ptr);
+    if std.str.eq(req.method, "shutdown") {
+        s.*.conn.&.send(.ResponseOk(.{ req_id, result = "null" }))
+    } else if std.str.eq(req.method, "textDocument/completion") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/completion'\n".ptr);
+    } else if std.str.eq(req.method, "completionItem/resolve") {
+        libc.fprintf(libc.stderr, "TODO: 'completionItem/resolve'\n".ptr);
+    } else if std.str.eq(req.method, "completionItem/signatureHelp") {
+        libc.fprintf(libc.stderr, "TODO: 'completionItem/signatureHelp'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/hover") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/hover'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/declaration") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/declaration'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/definition") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/definition'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/references") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/references'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/typeDefinition") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/typeDefinition'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/implementation") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/implementation'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/codeAction") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/codeAction'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/formatting") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/formatting'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/rangeFormatting") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/rangeFormatting'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/onTypeFormatting") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/onTypeFormatting'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/rename") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/rename'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/inlayHint") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/inlayHint'\n".ptr);
+    } else if std.str.eq(req.method, "textDocument/diagnostic") {
+        libc.fprintf(libc.stderr, "TODO: 'textDocument/diagnostic'\n".ptr);
+    } else if std.str.eq(req.method, "workspace/diagnostic") {
+        libc.fprintf(libc.stderr, "TODO: 'workspace/diagnostic'\n".ptr);
+    } else if std.str.eq(req.method, "workspace/diagnostic/refresh") {
+        libc.fprintf(libc.stderr, "TODO: 'workspace/diagnostic/refresh'\n".ptr);
+    } else {
+        s.*.conn.&.send(.ResponseErr(.{
+            req_id,
+            code = connection.METHOD_NOT_FOUND,
+            message = "unhandled method",
+        }))
+    }
 }

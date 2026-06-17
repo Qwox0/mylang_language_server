@@ -17,24 +17,28 @@ error() {
     if [ ${2:-1} -ne 0 ]; then exit ${2:-1}; fi
 }
 
-rm ~/.local/state/nvim/logs/lsp.log
+esc=$(printf '\033')
+bold_red="${esc}[91;1m"
+reset="${esc}[0m"
+newline_color="${esc}[2m"
+reset_newline_color="${esc}[22m"
+
+#rm ~/.local/state/nvim/logs/lsp.log || true
 
 tail -F ~/.local/state/nvim/logs/lsp.log |
     stdbuf -oL awk -F'\t' '$3 == "\"mylang_ls\""' |
     while IFS=$'\t' read -r i _ lsp _ body; do
-        echo "$(cut -d' ' -f -2 <<< "$i") $lsp:"
+        echo -n "${bold_red}$(cut -d' ' -f -2 <<< "$i") $lsp:${reset} "
 
-        body="${body#\'}"
-        body="${body%\'}"
-        body="${body#\"}"
-        body="${body%\"}"
-        echo "$body" | sed 's/\(\\r\)\?\\n/\n/g' | while read -r line; do
-            #echo "line: $line"
+        echo "$body" | "$script_dir/dev/out/split_around_jsons" | while read -r line; do
+            #warn "$(declare -p line)"
             if [[ "$line" == "{"* ]]; then
-                echo "$line" | sed 's/\\"/"/g' | jq -C || echo "E: $line"
+                fixed_json="$(sed 's/\\"/"/g;s/\\\\/\\/g' <<< "$line")"
+                #warn "$(declare -p fixed_json)"
+                echo -n "$fixed_json" | jq -C || echo "$fixed_json"
             else
-                echo "E: $line"
-            fi
+                echo -n "$line"
+            fi | sed 's/\(\\r\)\?\\n/'$newline_color'&\n⤷'$reset_newline_color'/g'
         done
-        echo ""
+        printf "\n\n"
     done

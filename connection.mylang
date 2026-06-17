@@ -2,7 +2,7 @@ std :: #import "std";
 libc :: #import "libc";
 Json :: std.json.Json;
 
-DEBUG :: true;
+DEBUG :: false;
 
 // `1` or `"1"`
 RequestId :: []u8;
@@ -248,7 +248,7 @@ Connection.send :: (c: *Connection, msg: Message) -> {
 
 // ------------------------------------
 
-Connection.initialize :: (req_buf: []mut u8) -> {
+Connection.initialize :: (req_buf: []mut u8, result: []u8) -> {
     conn := Connection.{};
 
     // "initialize" Request
@@ -281,10 +281,7 @@ Connection.initialize :: (req_buf: []mut u8) -> {
 
         // TODO: use req.params
 
-        conn.&.send(.ResponseOk(.{
-            req_id,
-            result = \\{"capabilities":{"definitionProvider":true},"serverInfo":{"name":"mylang_ls","version":"0.0.0"}}
-        }));
+        conn.&.send(.ResponseOk(.{ req_id, result }));
 
         break;
     }
